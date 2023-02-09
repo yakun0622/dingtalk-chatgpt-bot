@@ -8,28 +8,29 @@ import base64
 import hmac
 import hashlib
 import requests
-from pygpt import PyGPT
 import asyncio
 from quart import Quart, request
 
 import config
+from pygpt import PyGPT
 
 app = Quart(__name__)
+
 
 @app.route('/', methods=['GET', 'POST'])
 async def get_data():
     # 第一步验证：是否是post请求
     if request.method == "POST":
         try:
-            print('request.headers-----\n',request.headers)
+            print('DD request.headers-----\n', request.headers)
             # 签名验证 获取headers中的Timestamp和Sign
             req_data = await request.get_json()
             timestamp = request.headers.get('Timestamp')
             sign = request.headers.get('Sign')
-            print('request.data-----\n', req_data)
+            print('DD request.data-----\n', req_data)
             # 第二步验证：签名是否有效
             if check_sig(timestamp) == sign:
-                print('验证成功-----')
+                print('钉钉验签成功-----')
                 # 获取、处理数据 
                 # req_data = json.loads(str(data, 'utf-8'))
                 # print(req_data)
@@ -37,10 +38,11 @@ async def get_data():
                 await handle_info(req_data)
                 return str(req_data)
         except Exception as e:
-            timestamp = '出错啦～～'
+            timestamp = '处理钉钉消息出错啦～～'
             print('error', repr(e))
         return str(timestamp)
     return str(request.headers)
+
 
 # 处理自动回复消息
 async def handle_info(req_data):
@@ -57,22 +59,29 @@ async def handle_info(req_data):
             chat_gpt = PyGPT(config.GPT_SESSION)
             await chat_gpt.connect()
             await chat_gpt.wait_for_ready()
-            answer = await chat_gpt.ask(text_info)
+            print('conversations:')
+            print(chat_gpt.conversations)
+            chat_id = 'default'
+            if len(chat_gpt.conversations) > 0:
+                chat_id = chat_gpt.conversations[0]['id']
+            answer = await chat_gpt.ask(text_info, conv_id=chat_id)
             print('answer:\n', answer)
             await chat_gpt.disconnect()
-            await asyncio.sleep(10)
+            # await asyncio.sleep(10)
             print('--------------------------')
             break
         except Exception as e:
+            await chat_gpt.disconnect()
             retry_count = retry_count + 1
             print('retry_count', retry_count)
-            print('error\n', repr(e))
+            print('error\n', e)
             answer = ''
             continue
     if not answer:
         answer = '请求接口失败，请稍后重试'
     # 调用函数，发送markdown消息
     send_md_msg(senderid, answer, webhook_url)
+
 
 # 发送markdown消息
 def send_md_msg(userid, message, webhook_url):
@@ -88,7 +97,7 @@ def send_md_msg(userid, message, webhook_url):
     data = {
         "msgtype": "markdown",
         "markdown": {
-            "title":title,
+            "title": title,
             "text": message
         },
         # "msgtype": "text",
