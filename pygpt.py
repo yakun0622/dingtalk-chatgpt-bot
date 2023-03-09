@@ -1,17 +1,17 @@
-import os
-import time
+'''
+Uses API by [PawanOsman](https://github.com/PawanOsman/PyGPT)
+'''
+
 import uuid
-import json
-import base64
 import asyncio
 import socketio
 import datetime
-import threading
+import json
+import base64
 
 
 class PyGPT:
-    def __init__(self, session_token, timeout=120, bypass_node='https://gpt.pawan.krd', pro_account=False,
-                 name="default"):
+    def __init__(self, session_token, timeout=120, bypass_node='https://gpt.pawan.krd'):
         self.ready = False
         self.socket = socketio.AsyncClient()
         self.socket.on('connect', self.on_connect)
@@ -19,61 +19,15 @@ class PyGPT:
         self.socket.on('serverMessage', print)
         self.session_token = session_token
         self.conversations = []
-        self.pro_account = pro_account
-        self.expires = datetime.datetime.now()
-        self.auth = None
         self.timeout = timeout
+        self.auth = None
+        self.expires = datetime.datetime.now()
+        self.pause_token_checks = False
         self.bypass_node = bypass_node
-        self.pause_token_checks = True
-        self.filepath = f'{name}-PyGPT.json'
-        self.load()
         asyncio.create_task(self.cleanup_conversations())
-        thread = threading.Thread(target=self.save_interval)
-        thread.start()
-
-    def save(self):
-        print('saving to file....')
-        data = {
-            'session_token': self.session_token,
-            'conversations': self.conversations,
-            'proAccount': self.pro_account,
-            'expires': self.expires.isoformat(),
-            'auth': self.auth,
-        }
-        for conversation in self.conversations:
-            conversation['conversation_id'] = str(conversation['conversation_id'])
-            conversation['parent_id'] = str(conversation['parent_id'])
-            if isinstance(conversation['last_active'], str):
-                conversation['last_active'] = conversation['last_active'].isoformat()
-            else:
-                conversation['last_active'] = str(conversation['last_active'])
-        with open(self.filepath, 'w') as f:
-            json.dump(data, f, indent=4)
-
-    def load(self):
-        if os.path.exists(self.filepath):
-            with open(self.filepath, 'r') as f:
-                data = json.load(f)
-                self.session_token = data['session_token']
-                self.conversations = data['conversations']
-                self.pro_account = data['proAccount']
-                self.expires = datetime.datetime.fromisoformat(data['expires'])
-                self.auth = data['auth']
-                time.sleep(1)
-                self.pause_token_checks = False
-                if self.auth:
-                    self.ready = True
-        else:
-            time.sleep(1)
-            self.pause_token_checks = False
-
-    def save_interval(self):
-        while True:
-            time.sleep(60)
-            self.save()
 
     async def connect(self):
-        await self.socket.connect(f'{self.bypass_node}/?client=python&version=1.0.5&versionCode=105')
+        await self.socket.connect(f'{self.bypass_node}/?client=python&version=1.0.4&versionCode=104')
 
     async def disconnect(self):
         await self.socket.disconnect()
@@ -92,10 +46,9 @@ class PyGPT:
                 await asyncio.sleep(0.5)
                 continue
             self.pause_token_checks = True
-            now = datetime.datetime.utcnow()
+            now = datetime.datetime.now()
             offset = datetime.timedelta(minutes=2)
             if self.expires < (now - offset) or not self.auth:
-                print('Token expired, getting new token')
                 await self.get_tokens()
             self.pause_token_checks = False
             await asyncio.sleep(0.5)
@@ -103,27 +56,24 @@ class PyGPT:
     async def cleanup_conversations(self):
         while True:
             await asyncio.sleep(60)
-            print('cleanup_conversations....')
             now = datetime.datetime.now()
             self.conversations = [c for c in self.conversations if
-                                  now - datetime.datetime.strptime(c['last_active'], '%Y-%m-%dT%H:%M:%S.%f') < datetime.timedelta(minutes=10)]
+                                  now - c['last_active'] < datetime.timedelta(minutes=60)]
 
-    def add_conversation(self, conv_id):
-        print('add_conversation....')
+    def add_conversation(self, id):
         conversation = {
-            'id': conv_id,
+            'id': id,
             'conversation_id': None,
             'parent_id': uuid.uuid4(),
             'last_active': datetime.datetime.now()
         }
         self.conversations.append(conversation)
-        self.save()
         return conversation
 
-    def get_conversation_by_id(self, conv_id):
-        conversation = next((c for c in self.conversations if c['id'] == conv_id), None)
+    def get_conversation_by_id(self, id):
+        conversation = next((c for c in self.conversations if c['id'] == id), None)
         if conversation is None:
-            conversation = self.add_conversation(conv_id)
+            conversation = self.add_conversation(id)
         else:
             conversation['last_active'] = datetime.datetime.now()
         return conversation
@@ -133,36 +83,54 @@ class PyGPT:
             await asyncio.sleep(0.025)
         print('Ready!!')
 
-    async def ask(self, prompt, conv_id='default'):
-        if not self.auth or not self.validate_token():
-            print('Token expired, getting new token')
+    async def ask(self, prompt, query_db, id='default'):
+        if not self.auth or not self.validate_token(self.auth):
             await self.get_tokens()
-        conversation = self.get_conversation_by_id(conv_id)
+        conversation = self.get_conversation_by_id(id)
 
-        eventName = 'askQuestion' if not self.pro_account else 'askQuestionPro'
+        sqlite_get_data_query = """ SELECT * FROM user WHERE id = ? """
+        user_record = query_db(sqlite_get_data_query, (id,), True)
+        print('user_record', user_record)
 
         # Fix for timeout issue by Ulysses0817: https://github.com/Ulysses0817
-        data = await self.socket.call(event=eventName, data={
+        data = await self.socket.call(event='askQuestion', data={
             'prompt': prompt,
-            'parentId': str(conversation['parent_id']),
-            'conversationId': str(conversation['conversation_id']),
+            'parentId': user_record['parent_id'] if user_record else str(conversation['parent_id']),
+            'conversationId': user_record["conversation_id"] if user_record else str(conversation['conversation_id']),
             'auth': self.auth
         }, timeout=self.timeout)
-
+        print('ask data---\n', data)
         if 'error' in data:
             print(f'Error: {data["error"]}')
+            return f'Error: {data["error"]}'
+        try:
+            if user_record is None:
+                # 插入数据
+                sqlite_insert_data_query = """  INSERT INTO user
+                                                ('id', 'name', 'conversation_id', 'parent_id', 'create_at')
+                                                VALUES (?,?,?,?,?);  """
+                query_db(sqlite_insert_data_query,
+                         (id, None, data['conversationId'], data['messageId'], datetime.datetime.now()))
+                print('插入数据')
+            else:
+                # 更新数据
+                sqlite_update_data_query = """ UPDATE user SET id = ?, name = ?, conversation_id = ?, parent_id = ?, create_at = ? WHERE id = ? """
+                query_db(sqlite_update_data_query,
+                         (id, None, data['conversationId'], data['messageId'], datetime.datetime.now(), id))
+                print('更新数据')
+        except Exception as e:
+            print('database error\n', repr(e))
         conversation['parent_id'] = data['messageId']
         conversation['conversation_id'] = data['conversationId']
         return data['answer']
 
-    def validate_token(self):
-        if not self.auth:
+    def validate_token(self, token):
+        if not token:
             return False
-        parsed = json.loads(base64.b64decode(f'{self.auth.split(".")[1]}==').decode())
+        parsed = json.loads(base64.b64decode(f'{token.split(".")[1]}==').decode())
         return datetime.datetime.now() <= datetime.datetime.fromtimestamp(parsed['exp'])
 
     async def get_tokens(self):
-        print('Getting tokens...')
         await asyncio.sleep(1)
         # Fix for timeout issue by Ulysses0817: https://github.com/Ulysses0817
         data = await self.socket.call(event='getSession', data=self.session_token, timeout=self.timeout)
@@ -174,4 +142,3 @@ class PyGPT:
             self.expires = datetime.datetime.strptime(data['expires'], '%Y-%m-%dT%H:%M:%S.%fZ')
             self.session_token = data['sessionToken']
             self.ready = True
-            self.save()
