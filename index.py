@@ -1,92 +1,85 @@
-'''
-rt_data.py
-Receiver Transmitter Data 数据接收和发送器
-'''
-
-# from flask import Flask, request
 import base64
 import hmac
 import hashlib
 import requests
-import asyncio
-from quart import Quart, request
-
-import config
 from pygpt import PyGPT
+import datetime
+from quart import Quart, request
+import asyncio
+
+from sql import init_db, query_db
+import config
 
 app = Quart(__name__)
 
+init_db()
+
+chat_gpt = None
 
 @app.route('/', methods=['GET', 'POST'])
 async def get_data():
     # 第一步验证：是否是post请求
     if request.method == "POST":
         try:
-            print('DD request.headers-----\n', request.headers)
             # 签名验证 获取headers中的Timestamp和Sign
             req_data = await request.get_json()
             timestamp = request.headers.get('Timestamp')
             sign = request.headers.get('Sign')
-            print('DD request.data-----\n', req_data)
+            print('request.data-----\n', req_data)
             # 第二步验证：签名是否有效
             if check_sig(timestamp) == sign:
-                print('钉钉验签成功-----')
-                # 获取、处理数据 
-                # req_data = json.loads(str(data, 'utf-8'))
-                # print(req_data)
+                print('签名验证成功-----')
                 # 调用数据处理函数
                 await handle_info(req_data)
                 return str(req_data)
             else:
-                print('钉钉验签失败！请检查APP_SECRET是否正确')
+                result = '签名验证失败-----'
+                print(result)
+                return result
         except Exception as e:
-            timestamp = '处理钉钉消息出错啦～～'
+            result = '出错啦～～'
             print('error', repr(e))
-        return str(timestamp)
-    return str(request.headers)
-
+        return str(result)
+    return '钉钉机器人:' + str(datetime.datetime.now())
 
 # 处理自动回复消息
 async def handle_info(req_data):
-    # 解析用户发送消息 通讯webhook_url 
+    # 解析用户发送消息 通讯webhook_url
     text_info = req_data['text']['content'].strip()
     webhook_url = req_data['sessionWebhook']
     senderid = req_data['senderId']
+    # 打开新聊天窗口
+    if (text_info == '/reset'):
+        sqlite_delete_data_query = """ DELETE FROM 'user' WHERE id = ? """
+        query_db(sqlite_delete_data_query, (senderid,))
+        send_md_msg(senderid, '聊天上下文已重置', webhook_url)
+        return
     # 请求GPT回复，失败重新请求三次
     retry_count = 0
     max_retry_count = 3
-    print(webhook_url)
-
+    global chat_gpt
     while retry_count < max_retry_count:
         try:
-            chat_gpt = PyGPT(config.GPT_SESSION)
-            await chat_gpt.connect()
-            await chat_gpt.wait_for_ready()
-            print('conversations:')
-            print(chat_gpt.conversations)
-            chat_id = 'default'
-            # conv_info = chat_gpt.get_conversation_by_id(chat_id)
-            # print(conv_info)
-            # if len(chat_gpt.conversations) > 0:
-            #     chat_id = chat_gpt.conversations[0]['id']
-            answer = await chat_gpt.ask(text_info, conv_id=chat_id)
+            if chat_gpt is None:
+                connect_task = asyncio.create_task(init_connect())
+                await connect_task
+            answer = await chat_gpt.ask(text_info, query_db, senderid)
             print('answer:\n', answer)
-            await chat_gpt.disconnect()
-            # await asyncio.sleep(10)
             print('--------------------------')
             break
         except Exception as e:
-            await chat_gpt.disconnect()
             retry_count = retry_count + 1
             print('retry_count', retry_count)
-            print('error\n', e)
+            print('error\n', repr(e))
             answer = ''
+            if retry_count == 2:
+                connect_task = asyncio.create_task(init_connect())
+                await connect_task
             continue
     if not answer:
         answer = '请求接口失败，请稍后重试'
     # 调用函数，发送markdown消息
     send_md_msg(senderid, answer, webhook_url)
-
 
 # 发送markdown消息
 def send_md_msg(userid, message, webhook_url):
@@ -98,11 +91,11 @@ def send_md_msg(userid, message, webhook_url):
     '''
     message = '<font color=#008000>@%s </font>  \n\n %s' % (userid, message)
     title = '大聪明说'
-    print('message', message)
+
     data = {
         "msgtype": "markdown",
         "markdown": {
-            "title": title,
+            "title":title,
             "text": message
         },
         # "msgtype": "text",
@@ -118,7 +111,6 @@ def send_md_msg(userid, message, webhook_url):
     # 利用requests发送post请求
     req = requests.post(webhook_url, json=data)
 
-
 # 消息数字签名计算核对
 def check_sig(timestamp):
     app_secret = config.APP_SECRET
@@ -129,6 +121,23 @@ def check_sig(timestamp):
     sign = base64.b64encode(hmac_code).decode('utf-8')
     return sign
 
+async def init_connect():
+    # 建立连接
+    retry_count = 0
+    max_retry_count = 3
+
+    while retry_count < max_retry_count:
+        try:
+            global chat_gpt
+            chat_gpt = PyGPT(config.GPT_SESSION)
+            await chat_gpt.connect()
+            await chat_gpt.wait_for_ready()
+            break
+        except Exception as e:
+            retry_count = retry_count + 1
+            print('retry_count', retry_count)
+            print('error\n', repr(e))
+            continue
 
 if __name__ == '__main__':
     # 指定host和port，0.0.0.0可以运行在服务器上对外访问，记得开服务器的网络防火墙端口
